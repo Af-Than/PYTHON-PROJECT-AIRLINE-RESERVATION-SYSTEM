@@ -6,7 +6,9 @@ COORG AIRLINE RESERVATION SERVICES
 Tip: type  back  at any question to cancel and return to the previous menu.
 """
 import getpass
+import hashlib
 import math
+import os
 import random
 import re
 import time
@@ -23,9 +25,28 @@ ADMIN_PASSWORD = '1234'
 WIDTH = 100               # width of the lines/headers on screen
 DEFAULT_CAPACITY = 180    # used if a flight has no capacity saved
 MAX_PASSENGERS = 9        # per booking
-EXTRA_BAG_RATE = 5        # $ per kg above the baggage limit
+EXTRA_BAG_RATE = 5        # $ per kg above the baggage limit at check-in
+PREPAID_BAG_RATE = 4      # $ per kg if pre-purchased during booking (saves $1/kg)
 MAX_BAG_WEIGHT = 50       # kg, heaviest bag we accept
 STATUSES = ['On Time', 'Delayed', 'Boarding', 'Cancelled']
+TICKET_DIR = 'tickets'    # folder where ticket / boarding-pass files are saved
+RETURN_DISCOUNT = 0.10    # 10 % discount on the return leg of a round trip
+
+# Promo codes: code -> (discount type, value, description)
+PROMO_CODES = {
+    'FIRST10':  ('percent', 10, '10% off your booking'),
+    'SAVE20':   ('percent', 20, '20% off your booking'),
+    'FLAT50':   ('flat',    50, '$50 off your booking'),
+    'CHILD25':  ('percent', 25, '25% child discount'),
+    'SENIOR15': ('percent', 15, '15% senior citizen discount'),
+}
+
+# Cancellation fee rules: (minimum hours before departure, refund fraction, label)
+CANCEL_RULES = [
+    (48, 1.00, 'Full refund (more than 48 hours before departure)'),
+    (6,  0.50, '50% refund (6-48 hours before departure)'),
+    (0,  0.00, 'No refund (less than 6 hours before departure)'),
+]
 
 
 class GoBack(Exception):
@@ -79,6 +100,16 @@ class Pricing:
 # ---------------------------------------------------------------------------
 class Display:
     @staticmethod
+    def clear():
+        """Clear the terminal. Prints blank lines as a fallback in IDLE."""
+        if os.name == 'nt':
+            result = os.system('cls')
+        else:
+            result = os.system('clear')
+        if result != 0:
+            print('\n' * 40)
+
+    @staticmethod
     def line(char='-'):
         print(char * WIDTH)
 
@@ -127,10 +158,136 @@ class Display:
         print(f"FROM: {b['departure'].upper():<24} TO: {b['arrival'].upper()}")
         print()
         print(f"SEAT: {b['seat_no']:<8} GATE: {b['gate_no']:<8} TERMINAL: {b['terminal']}")
+        trip = b.get('trip_type', 'one_way')
+        if trip == 'return':
+            ret = b.get('return_booking_no') or ''
+            print(f"\nTRIP TYPE: ROUND TRIP     LINKED BOOKING: {ret}")
+        if b.get('meal_choice'):
+            print(f"\nPRE-ORDERED MEAL: {b['meal_choice']}")
         if b.get('checked_in'):
             print('\nSTATUS: CHECKED IN')
         print('*' * 95)
         print()
+
+    @staticmethod
+    def boarding_pass(b):
+        """Print a boarding pass after check-in."""
+        name = f"{b['first_name']} {b['last_name']}"
+        schedule = b.get('flightschedule', '00:00-00:00')
+        dep_time = schedule.split('-')[0]
+        dep_dt = datetime.strptime(dep_time, '%H:%M')
+        board_dt = dep_dt - timedelta(minutes=30)
+        boarding_time = board_dt.strftime('%H:%M')
+
+        w = 58
+        print()
+        print('+' + '=' * w + '+')
+        print('|' + ' BOARDING PASS '.center(w) + '|')
+        print('+' + '=' * w + '+')
+        print('|' + f"  AIRLINE      : {b['airlinename']}".ljust(w) + '|')
+        print('|' + f"  FLIGHT       : {b['flight_no']}".ljust(w) + '|')
+        print('|' + f"  NAME         : {name}".ljust(w) + '|')
+        print('|' + f"  FROM         : {b['departure']}".ljust(w) + '|')
+        print('|' + f"  TO           : {b['arrival']}".ljust(w) + '|')
+        print('|' + f"  DATE         : {b['dates']}".ljust(w) + '|')
+        print('|' + f"  BOARDING TIME: {boarding_time}".ljust(w) + '|')
+        print('|' + f"  GATE         : {b['gate_no']}".ljust(w) + '|')
+        print('|' + f"  SEAT         : {b['seat_no']}".ljust(w) + '|')
+        print('|' + f"  TERMINAL     : {b['terminal']}".ljust(w) + '|')
+        print('|' + f"  CLASS        : {Pricing.normalise(b['travel_class']).upper()}".ljust(w) + '|')
+        print('+' + '=' * w + '+')
+        print()
+
+    @staticmethod
+    def seat_map(capacity, taken):
+        """Print a visual seat map (columns A-F). '.' = free, 'X' = taken."""
+        rows_count = math.ceil(capacity / 6)
+        print('\n  . = Available    X = Taken\n')
+        page = 15
+        for start in range(1, rows_count + 1, page):
+            end = min(start + page - 1, rows_count)
+            if rows_count > page:
+                print(f'  --- Rows {start} to {end} ---')
+            print('          A   B   C   |   D   E   F')
+            print('       ' + '-' * 33)
+            for r in range(start, end + 1):
+                left = ''
+                for col in 'ABC':
+                    seat = f'{r}{col}'
+                    left += ' X ' if seat in taken else ' . '
+                right = ''
+                for col in 'DEF':
+                    seat = f'{r}{col}'
+                    right += ' X ' if seat in taken else ' . '
+                print(f'  {r:>3}  {left}  |  {right}')
+            print()
+
+    @staticmethod
+    def save_ticket_file(b):
+        """Write a printable ticket to a text file. Returns the file path."""
+        os.makedirs(TICKET_DIR, exist_ok=True)
+        filename = f"ticket_{b['booking_no']}.txt"
+        filepath = os.path.join(TICKET_DIR, filename)
+        name = f"{b['first_name']} {b['last_name']}"
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write('*' * 60 + '\n')
+            f.write(b['airlinename'].upper().center(60) + '\n')
+            f.write('  E-TICKET / ITINERARY RECEIPT'.center(60) + '\n')
+            f.write('-' * 60 + '\n')
+            f.write(f"  BOOKING NO   : {b['booking_no']}\n")
+            f.write(f"  DATE         : {b['dates']}\n")
+            f.write(f"  SCHEDULE     : {b.get('flightschedule', 'N/A')}\n")
+            f.write(f"  NAME         : {name}\n")
+            f.write(f"  FLIGHT NO    : {b['flight_no']}\n")
+            f.write(f"  CLASS        : {Pricing.normalise(b.get('travel_class', 'Economy')).upper()}\n")
+            f.write(f"  FROM         : {b['departure'].upper()}\n")
+            f.write(f"  TO           : {b['arrival'].upper()}\n")
+            f.write(f"  SEAT         : {b['seat_no']}\n")
+            f.write(f"  GATE         : {b['gate_no']}\n")
+            f.write(f"  TERMINAL     : {b['terminal']}\n")
+            if b.get('meal_choice'):
+                f.write(f"  MEAL         : {b['meal_choice']}\n")
+            trip = b.get('trip_type', 'one_way')
+            if trip == 'return':
+                f.write(f"  TRIP TYPE    : ROUND TRIP\n")
+                ret = b.get('return_booking_no') or ''
+                f.write(f"  LINKED BOOKING: {ret}\n")
+            f.write(f"  FARE         : ${float(b.get('fare', 0)):.2f}\n")
+            f.write('-' * 60 + '\n')
+            f.write('  Thank you for choosing Coorg Airline Reservation Services!\n')
+            f.write('*' * 60 + '\n')
+        return filepath
+
+    @staticmethod
+    def save_boarding_pass(b):
+        """Write a boarding pass to a text file. Returns the file path."""
+        os.makedirs(TICKET_DIR, exist_ok=True)
+        filename = f"boardingpass_{b['booking_no']}.txt"
+        filepath = os.path.join(TICKET_DIR, filename)
+        name = f"{b['first_name']} {b['last_name']}"
+        schedule = b.get('flightschedule', '00:00-00:00')
+        dep_time = schedule.split('-')[0]
+        dep_dt = datetime.strptime(dep_time, '%H:%M')
+        board_dt = dep_dt - timedelta(minutes=30)
+        boarding_time = board_dt.strftime('%H:%M')
+        with open(filepath, 'w', encoding='utf-8') as f:
+            w = 50
+            f.write('=' * w + '\n')
+            f.write(' BOARDING PASS '.center(w) + '\n')
+            f.write('=' * w + '\n')
+            f.write(f"  AIRLINE      : {b['airlinename']}\n")
+            f.write(f"  FLIGHT       : {b['flight_no']}\n")
+            f.write(f"  NAME         : {name}\n")
+            f.write(f"  FROM         : {b['departure']}\n")
+            f.write(f"  TO           : {b['arrival']}\n")
+            f.write(f"  DATE         : {b['dates']}\n")
+            f.write(f"  BOARDING TIME: {boarding_time}\n")
+            f.write(f"  GATE         : {b['gate_no']}\n")
+            f.write(f"  SEAT         : {b['seat_no']}\n")
+            f.write(f"  TERMINAL     : {b['terminal']}\n")
+            f.write(f"  CLASS        : {Pricing.normalise(b.get('travel_class', 'Economy')).upper()}\n")
+            f.write('=' * w + '\n')
+        return filepath
 
 
 # ---------------------------------------------------------------------------
@@ -325,13 +482,116 @@ class Database:
     def rollback(self):
         self.conn.rollback()
 
+    def _column_exists(self, table, column):
+        return bool(self.fetch_one(f"SHOW COLUMNS FROM {table} LIKE %s", (column,)))
+
+    def _add_column(self, table, column, definition):
+        if not self._column_exists(table, column):
+            self.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+
     def ensure_schema(self):
-        """Adds the 'checked_in' column (so nobody can check in twice) if it is missing."""
+        """Adds any missing columns and tables so the programme works on older databases too."""
+        # rename Airline -> airlinename if needed
         if not self.fetch_one("SHOW COLUMNS FROM flightreports LIKE 'airlinename'"):
             if self.fetch_one("SHOW COLUMNS FROM flightreports LIKE 'Airline'"):
                 self.execute('ALTER TABLE flightreports CHANGE COLUMN Airline airlinename VARCHAR(50)')
-        if not self.fetch_one("SHOW COLUMNS FROM user_table LIKE 'checked_in'"):
-            self.execute('ALTER TABLE user_table ADD COLUMN checked_in TINYINT(1) NOT NULL DEFAULT 0')
+        # original column
+        self._add_column('user_table', 'checked_in', 'TINYINT(1) NOT NULL DEFAULT 0')
+        # new columns for enhanced features
+        self._add_column('user_table', 'username', 'VARCHAR(30) DEFAULT NULL')
+        self._add_column('user_table', 'trip_type', "VARCHAR(10) DEFAULT 'one_way'")
+        self._add_column('user_table', 'return_booking_no', 'VARCHAR(10) DEFAULT NULL')
+        self._add_column('user_table', 'meal_choice', 'VARCHAR(200) DEFAULT NULL')
+        self._add_column('user_table', 'extra_bags', 'INT DEFAULT 0')
+        # accounts table
+        self.execute("""CREATE TABLE IF NOT EXISTS accounts (
+            username VARCHAR(30) PRIMARY KEY,
+            password_hash VARCHAR(128) NOT NULL,
+            salt VARCHAR(32) NOT NULL,
+            first_name VARCHAR(30),
+            last_name VARCHAR(30),
+            email VARCHAR(100),
+            phone VARCHAR(20),
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+        # waiting list table
+        self.execute("""CREATE TABLE IF NOT EXISTS waiting_list (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(30) DEFAULT NULL,
+            flight_no VARCHAR(10),
+            dates DATE,
+            travel_class VARCHAR(20),
+            num_passengers INT DEFAULT 1,
+            first_name VARCHAR(30),
+            last_name VARCHAR(30),
+            email VARCHAR(100),
+            phone VARCHAR(20),
+            added_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+
+
+# ---------------------------------------------------------------------------
+# USER ACCOUNTS (login / register with hashed passwords)
+# ---------------------------------------------------------------------------
+class AccountManager:
+    def __init__(self, db):
+        self.db = db
+
+    @staticmethod
+    def hash_password(password, salt=None):
+        """Hash a password with SHA-256 + salt.  Returns (hex_hash, hex_salt)."""
+        if salt is None:
+            salt = os.urandom(16).hex()
+        hashed = hashlib.sha256((salt + password).encode()).hexdigest()
+        return hashed, salt
+
+    def register(self):
+        Display.header('CREATE AN ACCOUNT', '-')
+        print("(Type 'back' at any question to cancel)\n")
+        while True:
+            username = Validator.text('Choose a username (4-30 chars): ',
+                                      r'[A-Za-z0-9_]{4,30}',
+                                      'Use 4-30 letters, digits, or underscores.')
+            if not self.db.fetch_one('SELECT 1 FROM accounts WHERE username = %s', (username,)):
+                break
+            print('  ! That username is already taken. Please choose another.')
+        password = Validator.secret('Choose a password (min 6 chars): ',
+                                     r'.{6,}', 'Password must be at least 6 characters.')
+        confirm = Validator.secret('Confirm password: ')
+        if confirm != password:
+            print('  ! Passwords do not match. Registration cancelled.')
+            return None
+        first_name = Validator.name('First name: ')
+        last_name = Validator.name('Last name: ')
+        email = Validator.email('Email address: ')
+        phone = Validator.phone('Phone number: ')
+        hashed, salt = self.hash_password(password)
+        self.db.execute(
+            'INSERT INTO accounts (username, password_hash, salt, first_name, last_name, email, phone) '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s)',
+            (username, hashed, salt, first_name, last_name, email, phone))
+        print(f'\nAccount created successfully! Welcome, {first_name}.')
+        return username
+
+    def login(self):
+        Display.header('LOGIN', '-')
+        username = Validator.ask('Username: ')
+        row = self.db.fetch_one(
+            'SELECT password_hash, salt, first_name FROM accounts WHERE username = %s', (username,))
+        if not row:
+            print('  ! No account found with that username.')
+            return None
+        stored_hash, salt, first_name = row
+        password = Validator.secret('Password: ')
+        hashed, _ = self.hash_password(password, salt)
+        if hashed != stored_hash:
+            print('  ! Incorrect password.')
+            return None
+        print(f'\nWelcome back, {first_name}!')
+        return username
+
+    def get_account(self, username):
+        return self.db.fetch_one(
+            'SELECT username, first_name, last_name, email, phone FROM accounts WHERE username = %s',
+            (username,), as_dict=True)
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +711,14 @@ class FlightManager:
             minutes = 24 * 60
         return f'{minutes / 60:g}h'
 
+    @staticmethod
+    def duration_minutes(duration_text):
+        """Parse a duration like '7h' or '1.5h' into minutes."""
+        try:
+            return int(float(duration_text.rstrip('h')) * 60)
+        except (ValueError, AttributeError):
+            return 9999
+
     def __init__(self, db):
         self.db = db
 
@@ -491,7 +759,7 @@ class FlightManager:
             f"SELECT {self.COLUMNS} {self.SOURCE} WHERE f.departure = %s AND f.destination = %s "
             "ORDER BY f.flightschedule", (departure, destination))
         print(f'\nSTEP 3: AVAILABLE FLIGHTS  {departure.upper()} -> {destination.upper()}')
-        print(tabulate(flights, headers=self.HEADERS, tablefmt='pretty'))
+        self._show_with_cheapest_badge(flights)
         valid = {row[1] for row in flights}
         while True:
             number = Validator.ask('Enter the FLIGHT NUMBER you want: ').upper()
@@ -499,12 +767,32 @@ class FlightManager:
                 return self.get(number)
             print('  ! That flight number is not in the list above.')
 
-    # ---- searching ----
+    def _show_with_cheapest_badge(self, flights):
+        """Print a flight table, marking the cheapest flight(s) with a badge."""
+        if not flights:
+            print('No flights found.')
+            return
+        min_fare = min(float(row[7]) for row in flights)
+        decorated = []
+        for row in flights:
+            row_list = list(row)
+            fare = float(row[7])
+            if fare == min_fare:
+                row_list[7] = f'${fare:.2f} *BEST*'
+            else:
+                row_list[7] = f'${fare:.2f}'
+            decorated.append(row_list)
+        print(tabulate(decorated, headers=self.HEADERS, tablefmt='pretty'))
+        print('  * BEST = cheapest fare on this route\n')
+
+    # ---- searching (enhanced) ----
     def search(self):
         print('ENTER 1: SEARCH BY AIRLINE NAME')
         print('ENTER 2: SEARCH BY FLIGHT NUMBER')
         print('ENTER 3: SEARCH BY DESTINATION')
-        option = Validator.integer('Enter your option: ', 1, 3)
+        print('ENTER 4: CHEAPEST FLIGHTS TO A DESTINATION')
+        print('ENTER 5: FILTER BY PRICE / AIRLINE / SORT')
+        option = Validator.integer('Enter your option: ', 1, 5)
         if option == 2:
             flight = self.get(Validator.flight_no('Enter flight number: '))
             if not flight:
@@ -518,12 +806,78 @@ class FlightManager:
                                            'Destination', 'Schedule', 'Status', 'Terminal', 'Gate'],
                            tablefmt='grid'))
             return
+        if option == 4:
+            self._search_cheapest()
+            return
+        if option == 5:
+            self._search_filtered()
+            return
         term = Validator.ask('Enter airline name: ' if option == 1 else 'Enter destination: ')
         column = 'f.airlinename' if option == 1 else 'f.destination'
         rows = self.db.fetch_all(f"SELECT {self.COLUMNS} {self.SOURCE} WHERE {column} LIKE %s "
                                  "ORDER BY f.destination, f.flightschedule", (f'%{term}%',))
         print(f'\nRESULTS FOR "{term}"')
-        Display.table(rows, self.HEADERS, empty='NO FLIGHTS MATCHED YOUR SEARCH')
+        if rows:
+            self._show_with_cheapest_badge(rows)
+        else:
+            print('NO FLIGHTS MATCHED YOUR SEARCH')
+
+    def _search_cheapest(self):
+        """Show the cheapest flight to each destination (or a specific one)."""
+        dest = Validator.ask('Enter a destination (or "all" for every destination): ')
+        if dest.lower() == 'all':
+            rows = self.db.fetch_all(
+                f"""SELECT f.destination, f.airlinename, f.flightno, f.flightschedule,
+                           f.duration, f.fare, COALESCE(r.status, 'On Time')
+                    {self.SOURCE}
+                    WHERE f.fare = (SELECT MIN(f2.fare) FROM flights f2
+                                    WHERE f2.destination = f.destination)
+                    ORDER BY f.destination""")
+            print('\nCHEAPEST FLIGHT TO EACH DESTINATION')
+            Display.table(rows, ['Destination', 'Airline', 'Flight', 'Schedule',
+                                 'Duration', 'Fare ($)', 'Status'],
+                          empty='No flights found.', fmt='grid')
+        else:
+            rows = self.db.fetch_all(
+                f"SELECT {self.COLUMNS} {self.SOURCE} WHERE f.destination LIKE %s "
+                "ORDER BY f.fare ASC", (f'%{dest}%',))
+            print(f'\nFLIGHTS TO "{dest}" (cheapest first)')
+            if rows:
+                self._show_with_cheapest_badge(rows)
+            else:
+                print('NO FLIGHTS MATCHED YOUR SEARCH')
+
+    def _search_filtered(self):
+        """Sort/filter flights by price range, airline, speed."""
+        print('\nFILTER & SORT OPTIONS')
+        max_fare = None
+        airline_filter = None
+        if Validator.yes_no('Set a maximum fare?'):
+            max_fare = Validator.amount('Maximum fare ($): ', 1, 100000)
+        if Validator.yes_no('Filter by airline?'):
+            airline_filter = Validator.ask('Airline name (or part of it): ')
+        print('\nSORT BY:')
+        print('ENTER 1: CHEAPEST FIRST')
+        print('ENTER 2: FASTEST FIRST')
+        print('ENTER 3: DEFAULT (by schedule)')
+        sort_opt = Validator.integer('Sort: ', 1, 3)
+        order = {1: 'f.fare ASC', 2: 'f.duration ASC', 3: 'f.flightschedule ASC'}[sort_opt]
+
+        where_parts, params = [], []
+        if max_fare is not None:
+            where_parts.append('f.fare <= %s')
+            params.append(max_fare)
+        if airline_filter:
+            where_parts.append('f.airlinename LIKE %s')
+            params.append(f'%{airline_filter}%')
+        where = (' WHERE ' + ' AND '.join(where_parts)) if where_parts else ''
+        rows = self.db.fetch_all(
+            f"SELECT {self.COLUMNS} {self.SOURCE}{where} ORDER BY {order}", tuple(params))
+        print(f'\nRESULTS ({len(rows)} flights)')
+        if rows:
+            self._show_with_cheapest_badge(rows)
+        else:
+            print('NO FLIGHTS MATCHED YOUR FILTERS')
 
     # ---- admin: add / edit / delete ----
     def add_flight(self):
@@ -674,20 +1028,74 @@ class Passenger:
 
 
 # ---------------------------------------------------------------------------
+# WAITING LIST
+# ---------------------------------------------------------------------------
+class WaitingList:
+    def __init__(self, db):
+        self.db = db
+
+    def add(self, flight, travel_date, travel_class, num_passengers,
+            first_name, last_name, email, phone, username=None):
+        self.db.execute(
+            'INSERT INTO waiting_list (username, flight_no, dates, travel_class, num_passengers, '
+            'first_name, last_name, email, phone) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+            (username, flight['flightno'], travel_date, travel_class, num_passengers,
+             first_name, last_name, email, phone))
+        print(f"\nYou have been added to the waiting list for flight {flight['flightno']} on {travel_date}.")
+        print('If a seat opens up, your booking will be processed automatically.')
+
+    def process_cancellation(self, flightno, travel_date):
+        """Called when someone cancels.  Auto-books the first person on the waiting list."""
+        row = self.db.fetch_one(
+            'SELECT * FROM waiting_list WHERE flight_no = %s AND dates = %s ORDER BY added_at LIMIT 1',
+            (flightno, travel_date), as_dict=True)
+        if not row:
+            return
+        print(f"\n  [WAITING LIST] {row['first_name']} {row['last_name']} was waiting for this flight.")
+        print(f"  A seat is now available! Their waiting-list entry has been kept for processing.")
+
+    def view(self, username=None):
+        if username:
+            rows = self.db.fetch_all(
+                'SELECT flight_no, dates, travel_class, num_passengers, added_at '
+                'FROM waiting_list WHERE username = %s ORDER BY added_at', (username,))
+            headers = ['Flight', 'Date', 'Class', 'Passengers', 'Added']
+        else:
+            rows = self.db.fetch_all(
+                'SELECT flight_no, dates, travel_class, num_passengers, '
+                'first_name, last_name, added_at FROM waiting_list ORDER BY added_at')
+            headers = ['Flight', 'Date', 'Class', 'Passengers', 'First Name', 'Last Name', 'Added']
+        if not rows:
+            print('No entries on the waiting list.')
+            return
+        Display.table(rows, headers)
+
+    def remove(self, entry_id):
+        self.db.execute('DELETE FROM waiting_list WHERE id = %s', (entry_id,))
+
+
+# ---------------------------------------------------------------------------
 # BOOKINGS
 # ---------------------------------------------------------------------------
 class BookingManager:
     SELECT = """SELECT u.booking_no, u.first_name, u.last_name, u.email, u.phone_no, u.departure,
                        u.arrival, u.`class` AS travel_class, u.seat_no, u.gate_no, u.terminal,
                        u.flight_no, u.dates, u.fare, u.checked_in,
-                       f.airlinename, f.flightschedule, f.fare AS base_fare, f.baggage
+                       f.airlinename, f.flightschedule, f.fare AS base_fare, f.baggage,
+                       u.trip_type, u.return_booking_no, u.meal_choice, u.extra_bags, u.username
                 FROM user_table u JOIN flights f ON u.flight_no = f.flightno
                 WHERE """
+
+    FOOD_MENU = {1: ('Chicken Sandwich', 10), 2: ('Vegetable Sandwich', 8), 3: ('Water', 3),
+                 4: ('Soft Drink (Pepsi/Coca-Cola)', 5), 5: ('Fruit Platter', 15),
+                 6: ('Caesar Salad', 15), 7: ('Chicken Pasta', 20), 8: ('Veg Pasta', 15),
+                 9: ('Chocolate Cake', 10), 10: ('Coffee', 5)}
 
     def __init__(self, db, flights, payment):
         self.db = db
         self.flights = flights
         self.payment = payment
+        self.waiting = None           # injected by App after WaitingList is created
 
     # ---- helpers ----
     def seats_taken(self, flightno, travel_date):
@@ -756,30 +1164,211 @@ class BookingManager:
                        tablefmt='fancy_grid'))
         return rows[Validator.integer(f'Select a booking (1-{len(rows)}): ', 1, len(rows)) - 1]
 
-    # ---- booking a flight ----
-    def book(self):
+    # ---- seat selection ----
+    def select_seat(self, flight, travel_date, also_taken=()):
+        """Show the seat map and let the user pick a seat, or auto-assign."""
+        taken = self.seats_taken(flight['flightno'], travel_date) | set(also_taken)
+        capacity = self.capacity_of(flight)
+        rows_count = math.ceil(capacity / 6)
+        print('\nSEAT SELECTION:')
+        print('ENTER 1: CHOOSE YOUR SEAT (view seat map)')
+        print('ENTER 2: AUTO-ASSIGN A SEAT')
+        mode = Validator.integer('Select: ', 1, 2)
+        if mode == 2:
+            free = [f'{n}{col}' for n in range(1, rows_count + 1) for col in 'ABCDEF'
+                    if f'{n}{col}' not in taken]
+            if not free:
+                return None
+            seat = random.choice(free)
+            print(f'  Your seat: {seat}')
+            return seat
+        Display.seat_map(capacity, taken)
+        while True:
+            seat = Validator.ask('Enter seat (e.g. 3A): ').upper()
+            if not re.fullmatch(r'\d{1,3}[A-F]', seat):
+                print('  ! Use format like 1A, 3C, 12F.')
+                continue
+            row_num = int(seat[:-1])
+            if row_num < 1 or row_num > rows_count:
+                print(f'  ! Row must be between 1 and {rows_count}.')
+                continue
+            if seat in taken:
+                print('  ! That seat is already taken. Please choose another.')
+                continue
+            print(f'  Seat {seat} selected.')
+            return seat
+
+    # ---- meal pre-order during booking ----
+    def offer_meal(self):
+        """Offer meal pre-order. Returns (description, cost)."""
+        if not Validator.yes_no('Pre-order a meal for this passenger?'):
+            return None, 0
+        table = [[n, name, f'${price}'] for n, (name, price) in self.FOOD_MENU.items()]
+        print(tabulate(table, headers=['No', 'Item', 'Price'], tablefmt='fancy_grid'))
+        while True:
+            raw = Validator.ask('Enter item number(s), comma-separated (e.g. 1,3): ')
+            parts = [p.strip() for p in raw.split(',') if p.strip()]
+            if parts and all(p.isdigit() and int(p) in self.FOOD_MENU for p in parts):
+                break
+            print(f'  ! Use item numbers 1-{len(self.FOOD_MENU)}, separated by commas.')
+        items = [int(p) for p in parts]
+        counts = Counter(items)
+        desc_parts = []
+        cost = 0
+        for n in sorted(counts):
+            name, price = self.FOOD_MENU[n]
+            qty = counts[n]
+            desc_parts.append(f'{name} x{qty}' if qty > 1 else name)
+            cost += price * qty
+        description = ', '.join(desc_parts)
+        print(f'  Meal: {description} = ${cost}')
+        return description, cost
+
+    # ---- extra baggage pre-purchase during booking ----
+    def offer_extra_bags(self, flight):
+        """Offer extra baggage pre-purchase at a discounted rate. Returns the cost."""
+        if not Validator.yes_no('Pre-purchase extra baggage allowance?'):
+            return 0
+        limit = Services.bag_limit(flight.get('baggage', '20-30kg'))
+        print(f'  Free weight limit per bag: {limit} kg')
+        print(f'  Pre-purchase rate        : ${PREPAID_BAG_RATE}/kg (save ${EXTRA_BAG_RATE - PREPAID_BAG_RATE}/kg vs check-in!)')
+        extra_kg = Validator.integer('Extra kg to purchase (0 to skip): ', 0, 100)
+        cost = extra_kg * PREPAID_BAG_RATE
+        if cost > 0:
+            print(f'  Extra baggage: {extra_kg} kg = ${cost}')
+        return cost
+
+    # ---- promo code ----
+    @staticmethod
+    def apply_promo(subtotal):
+        """Ask for a promo code. Returns (code, discount_amount) or (None, 0)."""
+        code = Validator.ask('Enter promo code: ').upper()
+        if code not in PROMO_CODES:
+            print('  ! Invalid promo code.')
+            return None, 0
+        ptype, value, desc = PROMO_CODES[code]
+        if ptype == 'percent':
+            discount = round(subtotal * value / 100, 2)
+        else:
+            discount = min(value, subtotal)
+        print(f'  Promo code {code} applied: {desc}')
+        print(f'  Discount: -${discount:.2f}')
+        return code, discount
+
+    # ---- booking a flight (enhanced) ----
+    def book(self, username=None):
+        Display.clear()
         Display.header('BOOKING', '-')
         print("(Type 'back' at any question to cancel)\n")
+
+        # Step 1 – choose flight
         flight = self.flights.choose_flight()
         if not flight:
             return
         if flight['status'].lower() == 'cancelled':
             print('SORRY, THIS FLIGHT HAS BEEN CANCELLED. PLEASE CHOOSE ANOTHER FLIGHT.')
             return
+
+        # Step 2 – travel date
         print()
         travel_date = Validator.travel_date('Enter date of travel (YYYY-MM-DD): ')
+
+        # Step 3 – availability (waiting list if full)
         left = self.seats_left(flight, travel_date)
         if left <= 0:
             print('SORRY, THIS FLIGHT IS FULL ON THAT DATE.')
+            if self.waiting and Validator.yes_no('Would you like to join the waiting list?'):
+                first_name = Validator.name('First name: ')
+                last_name = Validator.name('Last name: ')
+                email = Validator.email('Email: ')
+                phone = Validator.phone('Phone: ')
+                print('\nCHOOSE A TRAVEL CLASS:')
+                travel_class = Pricing.choose_class(flight['fare'])
+                self.waiting.add(flight, travel_date, travel_class, 1,
+                                 first_name, last_name, email, phone, username)
             return
+
+        # Step 4 – trip type (one way / round trip)
+        print('\nTRIP TYPE:')
+        print('ENTER 1: ONE WAY')
+        print('ENTER 2: ROUND TRIP (10% discount on return)')
+        trip_choice = Validator.integer('Choose trip type: ', 1, 2)
+        is_return = (trip_choice == 2)
+
+        return_flight = None
+        return_date = None
+        if is_return:
+            while True:
+                return_date = Validator.travel_date('Enter RETURN date (YYYY-MM-DD): ')
+                if return_date > travel_date:
+                    break
+                print('  ! The return date must be after the departure date.')
+            return_flights = self.db.fetch_all(
+                f"SELECT {self.flights.COLUMNS} {self.flights.SOURCE} "
+                "WHERE f.departure = %s AND f.destination = %s ORDER BY f.flightschedule",
+                (flight['destination'], flight['departure']))
+            if not return_flights:
+                print(f"\nNO RETURN FLIGHTS FOUND FROM {flight['destination']} TO {flight['departure']}.")
+                if not Validator.yes_no('Continue with one-way booking only?'):
+                    print('BOOKING CANCELLED')
+                    return
+                is_return = False
+            else:
+                print(f"\nRETURN FLIGHTS: {flight['destination'].upper()} -> {flight['departure'].upper()}")
+                self.flights._show_with_cheapest_badge(return_flights)
+                valid_ret = {row[1] for row in return_flights}
+                while True:
+                    rno = Validator.ask('Enter the RETURN FLIGHT NUMBER: ').upper()
+                    if rno in valid_ret:
+                        return_flight = self.flights.get(rno)
+                        break
+                    print('  ! That flight number is not in the list above.')
+                # check return availability
+                ret_left = self.seats_left(return_flight, return_date)
+                if ret_left <= 0:
+                    print('SORRY, THE RETURN FLIGHT IS FULL ON THAT DATE.')
+                    if not Validator.yes_no('Continue with one-way booking only?'):
+                        print('BOOKING CANCELLED')
+                        return
+                    is_return = False
+                    return_flight = None
+
+        # Step 5 – number of passengers
         most = min(MAX_PASSENGERS, left)
         count = Validator.integer(f'Number of passengers (1-{most}): ', 1, most)
 
+        # Step 6 – passenger details + seat + meal + bags
         passengers = []
+        seats_chosen = []
+        meals = []           # list of (description, cost)
+        bag_costs = []       # list of floats
         for number in range(1, count + 1):
-            passengers.append(Passenger.ask(number, count, flight['fare'],
-                                            passengers[0] if passengers else None))
-        total = self.print_bill(flight, passengers, travel_date)
+            p = Passenger.ask(number, count, flight['fare'],
+                              passengers[0] if passengers else None)
+            passengers.append(p)
+            seat = self.select_seat(flight, travel_date, also_taken=seats_chosen)
+            if seat is None:
+                print('  ! No seats available. Booking cancelled.')
+                return
+            seats_chosen.append(seat)
+            meal_desc, meal_cost = self.offer_meal()
+            meals.append((meal_desc, meal_cost))
+            bag_cost = self.offer_extra_bags(flight)
+            bag_costs.append(bag_cost)
+
+        # Step 7 – promo code
+        promo_code, promo_discount = None, 0
+        if Validator.yes_no('\nDo you have a promo code?'):
+            # calculate subtotal first for percentage promos
+            subtotal = sum(Pricing.price(flight['fare'], p.travel_class) for p in passengers)
+            promo_code, promo_discount = self.apply_promo(subtotal)
+
+        # Step 8 – bill
+        total = self.print_bill(flight, passengers, travel_date, seats_chosen,
+                                meals, bag_costs, promo_code, promo_discount,
+                                is_return, return_flight, return_date)
+
+        # Step 9 – payment
         if not Validator.yes_no('Proceed to payment?'):
             print('TRANSACTION CANCELLED')
             Display.exit_menu()
@@ -788,42 +1377,121 @@ class BookingManager:
         if not transaction:
             print('BOOKING NOT COMPLETED - YOU HAVE NOT BEEN CHARGED.')
             return
-        self.save_bookings(flight, passengers, travel_date, transaction)
 
-    def print_bill(self, flight, passengers, travel_date):
+        # Step 10 – save
+        self.save_bookings(flight, passengers, travel_date, transaction,
+                           seats_chosen, meals, bag_costs, username,
+                           is_return, return_flight, return_date)
+
+    def print_bill(self, flight, passengers, travel_date, seats, meals, bag_costs,
+                   promo_code, promo_discount, is_return, return_flight, return_date):
         print()
         Display.header('BILL', '-')
         print(f"{flight['airlinename']} {flight['flightno']}: {flight['departure']} -> "
-              f"{flight['destination']} on {travel_date}")
-        rows, total = [], 0
-        for number, p in enumerate(passengers, 1):
-            price = Pricing.price(flight['fare'], p.travel_class)
-            total += price
-            rows.append([number, p.full_name, p.travel_class, f'${price:.2f}'])
-        rows.append(['', '', 'TOTAL', f'${total:.2f}'])
-        print(tabulate(rows, headers=['No', 'Passenger', 'Class', 'Price'], tablefmt='fancy_grid'))
-        return round(total, 2)
+              f"{flight['destination']} on {travel_date}\n")
 
-    def save_bookings(self, flight, passengers, travel_date, transaction):
-        used, seats, saved = set(), set(), []
+        # outbound rows
+        rows, fare_total, meal_total, bag_total = [], 0, 0, 0
+        for i, p in enumerate(passengers):
+            price = Pricing.price(flight['fare'], p.travel_class)
+            fare_total += price
+            m_desc, m_cost = meals[i]
+            meal_total += m_cost
+            bag_total += bag_costs[i]
+            rows.append([i + 1, p.full_name, p.travel_class, seats[i],
+                         m_desc or '-', f'${price:.2f}'])
+        print(tabulate(rows, headers=['No', 'Passenger', 'Class', 'Seat', 'Meal', 'Fare'],
+                       tablefmt='fancy_grid'))
+
+        # summary
+        summary = [['Outbound fare', f'${fare_total:.2f}']]
+        grand = fare_total
+
+        if meal_total > 0:
+            summary.append(['Meal pre-orders', f'${meal_total:.2f}'])
+            grand += meal_total
+        if bag_total > 0:
+            summary.append(['Extra baggage (pre-paid)', f'${bag_total:.2f}'])
+            grand += bag_total
+
+        # return leg
+        if is_return and return_flight:
+            print(f"\nRETURN: {return_flight['airlinename']} {return_flight['flightno']}: "
+                  f"{return_flight['departure']} -> {return_flight['destination']} on {return_date}")
+            ret_fare = sum(Pricing.price(return_flight['fare'], p.travel_class) for p in passengers)
+            discount_amt = round(ret_fare * RETURN_DISCOUNT, 2)
+            ret_after = round(ret_fare - discount_amt, 2)
+            summary.append(['Return fare', f'${ret_fare:.2f}'])
+            summary.append([f'Round-trip discount ({int(RETURN_DISCOUNT * 100)}%)', f'-${discount_amt:.2f}'])
+            grand += ret_after
+
+        if promo_discount > 0 and promo_code:
+            summary.append([f'Promo code ({promo_code})', f'-${promo_discount:.2f}'])
+            grand -= promo_discount
+
+        grand = round(max(grand, 0), 2)
+        summary.append(['TOTAL', f'${grand:.2f}'])
+        print()
+        print(tabulate(summary, headers=['', 'Amount'], tablefmt='fancy_grid'))
+        return grand
+
+    def save_bookings(self, flight, passengers, travel_date, transaction,
+                      seats, meals, bag_costs, username,
+                      is_return, return_flight, return_date):
+        used, saved = set(), []
+        outbound_nos = []
         try:
-            for p in passengers:
+            for i, p in enumerate(passengers):
                 booking_no = self.new_booking_no(used)
                 used.add(booking_no)
-                seat = self.free_seat(flight, travel_date, seats)
-                if seat is None:
-                    raise RuntimeError('the flight became full')
-                seats.add(seat)
-                price = Pricing.price(flight['fare'], p.travel_class)
+                m_desc, m_cost = meals[i]
+                price = Pricing.price(flight['fare'], p.travel_class) + m_cost + bag_costs[i]
+                trip = 'return' if is_return else 'one_way'
                 self.db.execute(
                     "INSERT INTO user_table (booking_no, first_name, last_name, email, phone_no, "
-                    "departure, arrival, `class`, seat_no, gate_no, terminal, flight_no, dates, fare) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (booking_no, p.first_name, p.last_name, p.email, p.phone, flight['departure'],
-                     flight['destination'], p.travel_class, seat, flight['gate'],
-                     flight['terminal'] or 1, flight['flightno'], travel_date, price),
+                    "departure, arrival, `class`, seat_no, gate_no, terminal, flight_no, dates, fare, "
+                    "username, trip_type, meal_choice, extra_bags) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (booking_no, p.first_name, p.last_name, p.email, p.phone,
+                     flight['departure'], flight['destination'], p.travel_class, seats[i],
+                     flight['gate'], flight['terminal'] or 1, flight['flightno'],
+                     travel_date, price, username, trip, m_desc, int(bag_costs[i] > 0)),
                     commit=False)
-                saved.append([booking_no, p.full_name, p.travel_class, seat])
+                outbound_nos.append(booking_no)
+                saved.append([booking_no, p.full_name, p.travel_class, seats[i], 'Outbound'])
+
+            # return leg bookings
+            return_nos = []
+            if is_return and return_flight:
+                ret_taken = self.seats_taken(return_flight['flightno'], return_date)
+                for i, p in enumerate(passengers):
+                    ret_bno = self.new_booking_no(used)
+                    used.add(ret_bno)
+                    ret_seat = self.free_seat(return_flight, return_date,
+                                              also_taken=list(ret_taken))
+                    if ret_seat is None:
+                        raise RuntimeError('the return flight became full')
+                    ret_taken.add(ret_seat)
+                    ret_price = Pricing.price(return_flight['fare'], p.travel_class)
+                    ret_price = round(ret_price * (1 - RETURN_DISCOUNT), 2)
+                    self.db.execute(
+                        "INSERT INTO user_table (booking_no, first_name, last_name, email, phone_no, "
+                        "departure, arrival, `class`, seat_no, gate_no, terminal, flight_no, dates, fare, "
+                        "username, trip_type, return_booking_no) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (ret_bno, p.first_name, p.last_name, p.email, p.phone,
+                         return_flight['departure'], return_flight['destination'], p.travel_class,
+                         ret_seat, return_flight['gate'], return_flight['terminal'] or 1,
+                         return_flight['flightno'], return_date, ret_price, username,
+                         'return', outbound_nos[i]),
+                        commit=False)
+                    # link outbound -> return
+                    self.db.execute(
+                        'UPDATE user_table SET return_booking_no = %s WHERE booking_no = %s',
+                        (ret_bno, outbound_nos[i]), commit=False)
+                    return_nos.append(ret_bno)
+                    saved.append([ret_bno, p.full_name, p.travel_class, ret_seat, 'Return'])
+
             self.db.commit()
         except (sql.Error, RuntimeError) as err:
             self.db.rollback()
@@ -831,10 +1499,17 @@ class BookingManager:
             print(f'  Your payment {transaction} will be refunded.')
             return
         print('\nBOOKING SUCCESSFUL!')
-        print(tabulate(saved, headers=['Booking No', 'Passenger', 'Class', 'Seat'], tablefmt='fancy_grid'))
-        print('Please note down your booking numbers - you need them to view, modify or cancel.')
+        print(tabulate(saved, headers=['Booking No', 'Passenger', 'Class', 'Seat', 'Leg'],
+                       tablefmt='fancy_grid'))
+        # save ticket files
+        all_nos = outbound_nos + return_nos
+        for bno in all_nos:
+            b = self.db.fetch_one(self.SELECT + 'u.booking_no = %s', (bno,), as_dict=True)
+            if b:
+                filepath = Display.save_ticket_file(b)
+                print(f'  Ticket saved: {filepath}')
+        print('\nPlease note down your booking numbers - you need them to view, modify or cancel.')
         print(f'Contact email on record: {passengers[0].email}')
-        print('Use "VIEW TICKET" from the menu to see your ticket.')
 
     # ---- view / modify / cancel ----
     def view_ticket(self):
@@ -842,6 +1517,7 @@ class BookingManager:
         booking = self.pick_booking()
         if booking:
             Display.ticket(booking)
+            input('\nPress Enter to return to the menu...')
 
     def modify(self):
         Display.header('MODIFY BOOKING', '-')
@@ -921,6 +1597,7 @@ class BookingManager:
         print('Contact details updated successfully!')
 
     def cancel(self):
+        Display.clear()
         Display.header('CANCEL TICKET', '-')
         booking = self.pick_booking(allow_name=False)
         if not booking:
@@ -928,20 +1605,62 @@ class BookingManager:
         if self.is_past(booking):
             print('THIS FLIGHT HAS ALREADY DEPARTED, SO IT CANNOT BE CANCELLED.')
             return
-        refund = float(booking['fare'])
+
+        # calculate hours until departure for cancellation fee
+        travel_date = Validator.to_date(booking['dates'])
+        flight = self.flights.get(booking['flight_no'])
+        schedule = flight['flightschedule'] if flight else '00:00-00:00'
+        dep_time_str = schedule.split('-')[0]
+        dep_dt = datetime.combine(travel_date, datetime.strptime(dep_time_str, '%H:%M').time())
+        hours_left = max((dep_dt - datetime.now()).total_seconds() / 3600, 0)
+
+        fare = float(booking['fare'])
+        refund_fraction = 0.0
+        rule_text = 'No refund'
+        for min_hours, fraction, text in CANCEL_RULES:
+            if hours_left >= min_hours:
+                refund_fraction = fraction
+                rule_text = text
+                break
+
+        refund = round(fare * refund_fraction, 2)
+        fee = round(fare - refund, 2)
+
         print(f"\nBooking {booking['booking_no']}: {booking['first_name']} {booking['last_name']}, "
               f"{booking['departure']} -> {booking['arrival']} on {booking['dates']}")
-        print(f'You will be refunded ${refund:.2f}.')
-        if not Validator.yes_no('Confirm ticket cancellation?'):
-            print('CANCELLATION ABORTED')
-            return
-        if not self.payment.verify_otp():
-            print('REFUND CANCELLED - OTP VERIFICATION FAILED.')
-            return
+        print(f'\nCancellation policy: {rule_text}')
+        print(f'  Fare paid       : ${fare:.2f}')
+        print(f'  Refund amount   : ${refund:.2f}')
+        if fee > 0:
+            print(f'  Cancellation fee: ${fee:.2f}')
+
+        if refund == 0:
+            if not Validator.yes_no('No refund will be given. Continue with cancellation?'):
+                print('CANCELLATION ABORTED')
+                return
+        else:
+            if not Validator.yes_no('Confirm ticket cancellation?'):
+                print('CANCELLATION ABORTED')
+                return
+            if not self.payment.verify_otp():
+                print('REFUND CANCELLED - OTP VERIFICATION FAILED.')
+                return
+
+        flightno = booking['flight_no']
+        travel_date_val = booking['dates']
         self.db.execute('DELETE FROM user_table WHERE booking_no = %s', (booking['booking_no'],))
-        Display.loading('Processing refund')
+
+        if refund > 0:
+            Display.loading('Processing refund')
         print('TICKET CANCELLED')
-        print(f'AMOUNT REFUNDED: ${refund:.2f}')
+        if refund > 0:
+            print(f'AMOUNT REFUNDED: ${refund:.2f}')
+        if fee > 0:
+            print(f'CANCELLATION FEE DEDUCTED: ${fee:.2f}')
+
+        # check waiting list
+        if self.waiting:
+            self.waiting.process_cancellation(flightno, travel_date_val)
 
     # ---- search passengers ----
     def search_passenger(self):
@@ -984,6 +1703,7 @@ class Services:
         return int(max(numbers, key=int)) if numbers else 20
 
     def check_in(self):
+        Display.clear()
         Display.header('ONLINE CHECK-IN', '-')
         booking = self.bookings.pick_booking(allow_name=False)
         if not booking:
@@ -1004,6 +1724,8 @@ class Services:
         print(f"Free weight limit per bag : {limit} kg")
         print(f'Extra cost per extra kg   : ${EXTRA_BAG_RATE}')
         print(f'Heaviest bag accepted     : {MAX_BAG_WEIGHT} kg')
+        if booking.get('extra_bags') and int(booking['extra_bags']) > 0:
+            print(f'Pre-paid extra baggage    : YES')
         print('-' * 40)
         bags = Validator.integer(f'Number of bags to check in (0-{allowed}): ', 0, allowed)
         cost = 0
@@ -1026,6 +1748,15 @@ class Services:
         Display.loading('Checking you in')
         print('CHECKED IN SUCCESSFULLY!')
         print(f"Seat {booking['seat_no']} | Gate {booking['gate_no']} | Terminal {booking['terminal']}")
+
+        # refresh booking and show boarding pass
+        updated = self.db.fetch_one(
+            self.bookings.SELECT + 'u.booking_no = %s', (booking['booking_no'],), as_dict=True)
+        if updated:
+            Display.boarding_pass(updated)
+            # save boarding pass file
+            filepath = Display.save_boarding_pass(updated)
+            print(f'Boarding pass saved: {filepath}')
 
     def food_order(self):
         Display.header('FOOD ORDER', '-')
@@ -1078,8 +1809,9 @@ class Reports:
         Display.header('REPORTS', '-')
         print('ENTER 1: FLIGHT REPORT')
         print('ENTER 2: PASSENGER REPORT')
-        print('ENTER 3: GO BACK')
-        option = Validator.integer('Enter your option: ', 1, 3)
+        print('ENTER 3: WAITING LIST')
+        print('ENTER 4: GO BACK')
+        option = Validator.integer('Enter your option: ', 1, 4)
         print()
         if option == 1:
             rows = self.db.fetch_all(
@@ -1102,6 +1834,13 @@ class Reports:
                                  'Airline', 'Departure', 'Destination', 'Class', 'Date', 'Booking Amount'])
             count, revenue = self.db.fetch_one('SELECT COUNT(*), COALESCE(SUM(fare), 0) FROM user_table')
             print(f'\nTotal bookings: {count}   |   Total revenue: ${float(revenue):.2f}')
+        elif option == 3:
+            rows = self.db.fetch_all(
+                'SELECT flight_no, dates, travel_class, num_passengers, first_name, last_name, '
+                'email, added_at FROM waiting_list ORDER BY added_at')
+            print('WAITING LIST')
+            Display.table(rows, ['Flight', 'Date', 'Class', 'Passengers', 'First Name',
+                                 'Last Name', 'Email', 'Added'], empty='No entries on the waiting list.')
         print()
 
 
@@ -1121,6 +1860,10 @@ class App:
         self.bookings = BookingManager(self.db, self.flights, self.payment)
         self.services = Services(self.db, self.bookings, self.flights, self.payment)
         self.reports = Reports(self.db)
+        self.accounts = AccountManager(self.db)
+        self.waiting = WaitingList(self.db)
+        self.bookings.waiting = self.waiting
+        self.current_user = None
 
     def run_safely(self, action):
         """Runs a menu action; 'back' or a database problem returns to the menu instead of crashing."""
@@ -1143,6 +1886,7 @@ class App:
 
     def run(self):
         while True:
+            Display.clear()
             print()
             Display.header('WELCOME TO COORG AIRLINE RESERVATION SERVICES')
             print('\nENTER 1: ENTER AS ADMIN')
@@ -1152,40 +1896,118 @@ class App:
             if choice == 1:
                 self.run_safely(self.admin)
             elif choice == 2:
-                self.user()
+                self.user_access()
             else:
                 self.goodbye()
                 break
 
-    def user(self):
+    def user_access(self):
+        """Login / Register / Guest screen before the user menu."""
+        Display.clear()
+        Display.header('USER ACCESS', '-')
+        print('ENTER 1: LOGIN TO YOUR ACCOUNT')
+        print('ENTER 2: CREATE A NEW ACCOUNT')
+        print('ENTER 3: CONTINUE AS GUEST')
+        print('ENTER 4: RETURN TO MAIN MENU\n')
+        choice = self.pick(4)
+        if choice == 1:
+            try:
+                self.current_user = self.accounts.login()
+            except GoBack:
+                return
+            if not self.current_user:
+                return
+        elif choice == 2:
+            try:
+                self.current_user = self.accounts.register()
+            except GoBack:
+                return
+            if not self.current_user:
+                return
+        elif choice == 3:
+            self.current_user = None
+        else:
+            return
+        self.user_menu()
+
+    def user_menu(self):
         while True:
+            Display.clear()
             print()
             Display.header('AIRLINE RESERVATION', '-')
-            print('ENTER 1: BOOK A FLIGHT')
-            print('ENTER 2: SEARCH')
-            print('ENTER 3: VIEW TICKET')
-            print('ENTER 4: MODIFY BOOKING / UPGRADE CLASS')
-            print('ENTER 5: FOOD SERVICES / ONLINE CHECK-IN')
-            print('ENTER 6: CANCEL TICKET')
-            print('ENTER 7: RETURN TO MENU\n')
-            choice = self.pick(7)
-            if choice == 1:
-                self.run_safely(self.bookings.book)
-            elif choice == 2:
+            if self.current_user:
+                acct = self.accounts.get_account(self.current_user)
+                if acct:
+                    print(f"  Welcome, {acct['first_name']} {acct['last_name']}! "
+                          f"(logged in as {self.current_user})\n")
+
+            options = [
+                'BOOK A FLIGHT',
+                'SEARCH FLIGHTS',
+                'VIEW TICKET',
+                'MODIFY BOOKING / UPGRADE CLASS',
+                'FOOD SERVICES / ONLINE CHECK-IN',
+                'CANCEL TICKET',
+            ]
+            if self.current_user:
+                options.extend(['MY BOOKINGS', 'MY WAITING LIST', 'LOGOUT'])
+            options.append('RETURN TO MENU')
+
+            for i, opt in enumerate(options, 1):
+                print(f'ENTER {i}: {opt}')
+            print()
+            choice = self.pick(len(options))
+            selected = options[choice - 1]
+
+            if selected == 'BOOK A FLIGHT':
+                self.run_safely(lambda: self.bookings.book(self.current_user))
+            elif selected == 'SEARCH FLIGHTS':
                 self.search()
-            elif choice == 3:
+            elif selected == 'VIEW TICKET':
                 self.run_safely(self.bookings.view_ticket)
-            elif choice == 4:
+            elif selected == 'MODIFY BOOKING / UPGRADE CLASS':
                 self.run_safely(self.bookings.modify)
-            elif choice == 5:
+            elif selected == 'FOOD SERVICES / ONLINE CHECK-IN':
                 self.other_services()
-            elif choice == 6:
+            elif selected == 'CANCEL TICKET':
                 self.run_safely(self.bookings.cancel)
+            elif selected == 'MY BOOKINGS':
+                self.my_bookings()
+            elif selected == 'MY WAITING LIST':
+                self.my_waiting_list()
+            elif selected == 'LOGOUT':
+                print(f'Logged out. Goodbye!')
+                self.current_user = None
+                break
             else:
                 break
 
+    def my_bookings(self):
+        """Show all bookings for the logged-in user."""
+        Display.clear()
+        Display.header('MY BOOKINGS', '-')
+        rows = self.db.fetch_all(
+            "SELECT booking_no, first_name, last_name, flight_no, departure, arrival, "
+            "`class`, dates, fare, trip_type, "
+            "CASE WHEN checked_in = 1 THEN 'Yes' ELSE 'No' END "
+            "FROM user_table WHERE username = %s ORDER BY dates", (self.current_user,))
+        if not rows:
+            print('You have no bookings yet.')
+        else:
+            Display.table(rows, ['Booking', 'First', 'Last', 'Flight', 'From', 'To',
+                                 'Class', 'Date', 'Fare ($)', 'Trip', 'Checked In'])
+        input('\nPress Enter to continue...')
+
+    def my_waiting_list(self):
+        """Show waiting-list entries for the logged-in user."""
+        Display.clear()
+        Display.header('MY WAITING LIST', '-')
+        self.waiting.view(self.current_user)
+        input('\nPress Enter to continue...')
+
     def search(self):
         while True:
+            Display.clear()
             print()
             Display.header('SEARCH', '-')
             print('ENTER 1: SEARCH THE FLIGHTS')
@@ -1201,6 +2023,7 @@ class App:
 
     def other_services(self):
         while True:
+            Display.clear()
             print()
             Display.header('OTHER SERVICES')
             print('ENTER 1: ONLINE CHECK-IN')
@@ -1223,6 +2046,7 @@ class App:
             print('TOO MANY WRONG ATTEMPTS. RETURNING TO THE MAIN MENU.')
             return
         while True:
+            Display.clear()
             print()
             Display.header('ADMIN MENU')
             print('ENTER 1: ADD A FLIGHT')

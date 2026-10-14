@@ -1,0 +1,20 @@
+************************************************************
+                            KLM                             
+                 E-TICKET / ITINERARY RECEIPT               
+------------------------------------------------------------
+  BOOKING NO   : DEB488
+  DATE         : 2027-1-11
+  SCHEDULE     : 07:30-13:30
+  NAME         : Afthan M
+  FLIGHT NO    : KL428
+  CLASS        : FIRST
+  FROM         : BAHRAIN
+  TO           : AMSTERDAM
+  SEAT         : 29A
+  GATE         : C6
+  TERMINAL     : 3
+  MEAL         : Chicken Sandwich, Vegetable Sandwich, Water
+  FARE         : $1821.00
+------------------------------------------------------------
+  Thank you for choosing Coorg Airline Reservation Services!
+************************************************************

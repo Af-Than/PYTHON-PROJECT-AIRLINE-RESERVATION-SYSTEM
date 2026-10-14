@@ -167,7 +167,39 @@ def setup_database():
         email VARCHAR(100), phone_no VARCHAR(20), departure VARCHAR(40), arrival VARCHAR(40),
         `class` VARCHAR(20), seat_no VARCHAR(5), gate_no VARCHAR(5), terminal INT,
         flight_no VARCHAR(10), dates DATE, fare DECIMAL(10,2),
-        checked_in TINYINT(1) NOT NULL DEFAULT 0)""")
+        checked_in TINYINT(1) NOT NULL DEFAULT 0,
+        username VARCHAR(30) DEFAULT NULL,
+        trip_type VARCHAR(10) DEFAULT 'one_way',
+        return_booking_no VARCHAR(10) DEFAULT NULL,
+        meal_choice VARCHAR(200) DEFAULT NULL,
+        extra_bags INT DEFAULT 0)""")
+
+    # ---- NEW TABLES for the enhanced features ----
+
+    # User accounts (login with hashed passwords)
+    cur.execute("""CREATE TABLE IF NOT EXISTS accounts (
+        username VARCHAR(30) PRIMARY KEY,
+        password_hash VARCHAR(128) NOT NULL,
+        salt VARCHAR(32) NOT NULL,
+        first_name VARCHAR(30),
+        last_name VARCHAR(30),
+        email VARCHAR(100),
+        phone VARCHAR(20),
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+
+    # Waiting list (join when a flight is full)
+    cur.execute("""CREATE TABLE IF NOT EXISTS waiting_list (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(30) DEFAULT NULL,
+        flight_no VARCHAR(10),
+        dates DATE,
+        travel_class VARCHAR(20),
+        num_passengers INT DEFAULT 1,
+        first_name VARCHAR(30),
+        last_name VARCHAR(30),
+        email VARCHAR(100),
+        phone VARCHAR(20),
+        added_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
 
     # remove the test row that was in the old CSV files, if it was imported
     cur.execute("DELETE FROM flights WHERE flightno = '23333333333333333'")
