@@ -37,7 +37,7 @@ PROMO_CODES = {
     'FIRST10':  ('percent', 10, '10% off your booking'),
     'SAVE20':   ('percent', 20, '20% off your booking'),
     'FLAT50':   ('flat',    50, '$50 off your booking'),
-    'CHILD25':  ('percent', 25, '25% child discount'),
+    'CHILD25':  ('percent', 25, '25% child discount'),                                                                                          
     'SENIOR15': ('percent', 15, '15% senior citizen discount'),
 }
 
@@ -861,7 +861,7 @@ class FlightManager:
         print('ENTER 2: FASTEST FIRST')
         print('ENTER 3: DEFAULT (by schedule)')
         sort_opt = Validator.integer('Sort: ', 1, 3)
-        order = {1: 'f.fare ASC', 2: 'f.duration ASC', 3: 'f.flightschedule ASC'}[sort_opt]
+        order = {1: 'f.fare ASC', 2: 'f.flightschedule ASC', 3: 'f.flightschedule ASC'}[sort_opt]
 
         where_parts, params = [], []
         if max_fare is not None:
@@ -873,6 +873,8 @@ class FlightManager:
         where = (' WHERE ' + ' AND '.join(where_parts)) if where_parts else ''
         rows = self.db.fetch_all(
             f"SELECT {self.COLUMNS} {self.SOURCE}{where} ORDER BY {order}", tuple(params))
+        if sort_opt == 2:      # fastest first (duration is stored as text like '10h')
+            rows = sorted(rows, key=lambda r: self.duration_minutes(r[5]))
         print(f'\nRESULTS ({len(rows)} flights)')
         if rows:
             self._show_with_cheapest_badge(rows)
@@ -1042,24 +1044,28 @@ class WaitingList:
             (username, flight['flightno'], travel_date, travel_class, num_passengers,
              first_name, last_name, email, phone))
         print(f"\nYou have been added to the waiting list for flight {flight['flightno']} on {travel_date}.")
-        print('If a seat opens up, your booking will be processed automatically.')
+        print("Check 'MY WAITING LIST' later - it will show when a seat is free, then you can book.")
 
     def process_cancellation(self, flightno, travel_date):
         """Called when someone cancels.  Auto-books the first person on the waiting list."""
-        row = self.db.fetch_one(
-            'SELECT * FROM waiting_list WHERE flight_no = %s AND dates = %s ORDER BY added_at LIMIT 1',
-            (flightno, travel_date), as_dict=True)
-        if not row:
-            return
-        print(f"\n  [WAITING LIST] {row['first_name']} {row['last_name']} was waiting for this flight.")
-        print(f"  A seat is now available! Their waiting-list entry has been kept for processing.")
+        # Entries stay on the list; view() shows "Yes" under "Seat free?" once a seat opens up.
+        return
+
+    def seat_free(self, flight_no, travel_date):
+        """True if the flight now has at least one free seat on that date."""
+        cap = self.db.fetch_one('SELECT capacity FROM flightreports WHERE flightno = %s', (flight_no,))
+        capacity = (cap[0] if cap and cap[0] else DEFAULT_CAPACITY)
+        taken = self.db.fetch_one('SELECT COUNT(*) FROM user_table WHERE flight_no = %s AND dates = %s',
+                                  (flight_no, travel_date))[0]
+        return taken < capacity
 
     def view(self, username=None):
         if username:
             rows = self.db.fetch_all(
                 'SELECT flight_no, dates, travel_class, num_passengers, added_at '
                 'FROM waiting_list WHERE username = %s ORDER BY added_at', (username,))
-            headers = ['Flight', 'Date', 'Class', 'Passengers', 'Added']
+            headers = ['Flight', 'Date', 'Class', 'Passengers', 'Added', 'Seat free?']
+            rows = [list(r) + ['Yes' if self.seat_free(r[0], r[1]) else 'No'] for r in rows]
         else:
             rows = self.db.fetch_all(
                 'SELECT flight_no, dates, travel_class, num_passengers, '
@@ -1297,6 +1303,7 @@ class BookingManager:
 
         return_flight = None
         return_date = None
+        ret_left = None
         if is_return:
             while True:
                 return_date = Validator.travel_date('Enter RETURN date (YYYY-MM-DD): ')
@@ -1325,7 +1332,14 @@ class BookingManager:
                     print('  ! That flight number is not in the list above.')
                 # check return availability
                 ret_left = self.seats_left(return_flight, return_date)
-                if ret_left <= 0:
+                if return_flight['status'].lower() == 'cancelled':
+                    print('SORRY, THE RETURN FLIGHT HAS BEEN CANCELLED.')
+                    if not Validator.yes_no('Continue with one-way booking only?'):
+                        print('BOOKING CANCELLED')
+                        return
+                    is_return = False
+                    return_flight = None
+                elif ret_left <= 0:
                     print('SORRY, THE RETURN FLIGHT IS FULL ON THAT DATE.')
                     if not Validator.yes_no('Continue with one-way booking only?'):
                         print('BOOKING CANCELLED')
@@ -1335,6 +1349,8 @@ class BookingManager:
 
         # Step 5 – number of passengers
         most = min(MAX_PASSENGERS, left)
+        if is_return and return_flight:
+            most = min(most, ret_left)      # the return flight needs a seat for everyone too
         count = Validator.integer(f'Number of passengers (1-{most}): ', 1, most)
 
         # Step 6 – passenger details + seat + meal + bags
@@ -1381,7 +1397,7 @@ class BookingManager:
         # Step 10 – save
         self.save_bookings(flight, passengers, travel_date, transaction,
                            seats_chosen, meals, bag_costs, username,
-                           is_return, return_flight, return_date)
+                           is_return, return_flight, return_date, promo_discount)
 
     def print_bill(self, flight, passengers, travel_date, seats, meals, bag_costs,
                    promo_code, promo_discount, is_return, return_flight, return_date):
@@ -1437,15 +1453,19 @@ class BookingManager:
 
     def save_bookings(self, flight, passengers, travel_date, transaction,
                       seats, meals, bag_costs, username,
-                      is_return, return_flight, return_date):
+                      is_return, return_flight, return_date, promo_discount=0):
         used, saved = set(), []
+        base_prices = [Pricing.price(flight['fare'], p.travel_class) for p in passengers]
+        base_total = sum(base_prices) or 1
         outbound_nos = []
         try:
             for i, p in enumerate(passengers):
                 booking_no = self.new_booking_no(used)
                 used.add(booking_no)
                 m_desc, m_cost = meals[i]
-                price = Pricing.price(flight['fare'], p.travel_class) + m_cost + bag_costs[i]
+                # each passenger's share of the promo discount, so a later refund matches what was paid
+                share = round(promo_discount * base_prices[i] / base_total, 2)
+                price = round(base_prices[i] - share + m_cost + bag_costs[i], 2)
                 trip = 'return' if is_return else 'one_way'
                 self.db.execute(
                     "INSERT INTO user_table (booking_no, first_name, last_name, email, phone_no, "
@@ -1517,7 +1537,6 @@ class BookingManager:
         booking = self.pick_booking()
         if booking:
             Display.ticket(booking)
-            input('\nPress Enter to return to the menu...')
 
     def modify(self):
         Display.header('MODIFY BOOKING', '-')
@@ -1872,9 +1891,12 @@ class App:
         except GoBack:
             print('\nCancelled.')
             Display.exit_menu()
+            return
         except sql.Error as err:
             self.db.rollback()
             print(f'\n  ! Database problem: {err}\n  Nothing was changed. Please try again.')
+        # pause so the result stays on screen (the next menu clears the screen)
+        input('\nPress Enter to continue...')
 
     @staticmethod
     def pick(high):
